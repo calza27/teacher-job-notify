@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  teacher-job-notify: daily scrape of EduPay for primary teaching jobs in
+  Casey/Cardinia, emailing new ones via SNS.
+
+Parameters:
+  SecretName:
+    Type: String
+    Default: teacher-job-notify
+    Description: 'Secrets Manager secret (created by infra/secrets.yaml) holding {"notify_email": "..."}.'
+
+Resources:
+  ScraperFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      CodeUri: ../scraper
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      MemorySize: 512
+      # Searches take ~25s; each new job's link lookup adds 1-3 requests.
+      Timeout: 300
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref SeenJobsTable
+          TOPIC_ARN: !Ref AlertTopic
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:BatchGetItem, dynamodb:BatchWriteItem]
+              Resource: !GetAtt SeenJobsTable.Arn
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertTopic.TopicName
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(0 17 * * ? *)
+            ScheduleExpressionTimezone: Australia/Melbourne
+            RetryPolicy:
+              MaximumRetryAttempts: 0
+
+  ScraperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ScraperFunction}
+      RetentionInDays: 30
+
+  SeenJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      # The scraper sets expires_at to 30 days after the job was notified.
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Teacher Jobs
+
+  # The address is read from Secrets Manager when CloudFormation creates or
+  # updates this resource; it never appears in the template or parameters.
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Sub "{{resolve:secretsmanager:${SecretName}:SecretString:notify_email}}"
+
+  # Email the same address if a run fails, e.g. because the site changed.
+  ScraperErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: teacher-job-notify scraper failed. Check its CloudWatch logs.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScraperFunction
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  FunctionName:
+    Value: !Ref ScraperFunction
+  TableName:
+    Value: !Ref SeenJobsTable
+  TopicArn:
+    Value: !Ref AlertTopic
